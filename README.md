@@ -112,6 +112,6 @@ If you find the resources in this repository useful, please consider citing:
   author    = {Jason Lee and Elman Mansimov and Kyunghyun Cho},
   title     = {Deterministic Non-Autoregressive Neural Sequence Modeling by Iterative Refinement},
   year      = {2018},
-  journal   = {arXiv preprint arXiv:1802.abcde},
+  journal   = {arXiv preprint arXiv:1802.06901},
 }
 ```
