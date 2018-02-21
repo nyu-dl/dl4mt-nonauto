@@ -1,6 +1,6 @@
 Deterministic Non-Autoregressive Neural Sequence Modeling by Iterative Refinement
 ==================================
-PyTorch implementation of the models described in the paper "Deterministic Non-Autoregressive Neural Sequence Modeling by Iterative Refinement".
+PyTorch implementation of the models described in the paper [Deterministic Non-Autoregressive Neural Sequence Modeling by Iterative Refinement](https://arxiv.org/abs/1802.06901 "Deterministic Non-Autoregressive Neural Sequence Modeling by Iterative Refinement").
 
 We present code for training and decoding both autoregressive and non-autoregressive models, as well as preprocessed datasets and pretrained models.
 
