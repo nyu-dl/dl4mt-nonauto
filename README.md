@@ -1,3 +1,8 @@
+## This is the legacy version used for ICML 2018 rejected submission and kept here for reference
+
+## Please checkout [multigpu branch](https://github.com/nyu-dl/dl4mt-nonauto/tree/multigpu) for latest (cleaner) version with newer experiments reported in EMNLP 2018 paper
+==================================
+
 Deterministic Non-Autoregressive Neural Sequence Modeling by Iterative Refinement
 ==================================
 PyTorch implementation of the models described in the paper [Deterministic Non-Autoregressive Neural Sequence Modeling by Iterative Refinement](https://arxiv.org/abs/1802.06901 "Deterministic Non-Autoregressive Neural Sequence Modeling by Iterative Refinement").
@@ -34,7 +39,7 @@ The original translation corpora can be downloaded from ([IWLST'16 En-De](https:
 
 Before you run the code
 ------------------
-Set correct path to data in `data_path()` function located in [`data.py`](https://github.com/jasonleeinf/non-auto-decoding/blob/96f7765399133c79ad4d23768dd530ee3eb07990/data.py#L44): 
+Set correct path to data in `data_path()` function located in [`data.py`](https://github.com/jasonleeinf/non-auto-decoding/blob/96f7765399133c79ad4d23768dd530ee3eb07990/data.py#L44):
 
 Loading & Decoding from Pre-trained Models
 ------------------
