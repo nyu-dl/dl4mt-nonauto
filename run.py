@@ -10,7 +10,6 @@ from torch.autograd import Variable
 import revtok
 import logging
 import random
-import ipdb
 import string
 import traceback
 import math
@@ -22,7 +21,7 @@ import pickle
 
 from train import train_model
 from distill import distill_model
-from model import FastTransformer, Transformer, INF, TINY, HighwayBlock, ResidualBlock, NonresidualBlock
+from model import FastTransformer, Transformer, MultiGPUTransformer, MultiGPUFastTransformer, INF, TINY, HighwayBlock, ResidualBlock, NonresidualBlock
 from utils import mkdir, organise_trg_len_dic, init_encoder
 from data import NormalField, NormalTranslationDataset, MSCOCODataset, data_path
 from time import gmtime, strftime
@@ -39,9 +38,11 @@ parser = argparse.ArgumentParser(description='Train a Transformer / FastTransfor
 # dataset settings
 parser.add_argument('--dataset',     type=str, default='iwslt-ende', choices=['iwslt-ende', 'iwslt-deen', \
                                                                               'wmt15-ende', 'wmt15-deen', \
+                                                                              'wmt14-ende', 'wmt14-deen', \
                                                                               'wmt16-enro', 'wmt16-roen', \
                                                                               'wmt17-enlv', 'wmt17-lven', \
                                                                               'mscoco'])
+parser.add_argument('--data_path', type=str, default=None)
 parser.add_argument('--vocab_size',      type=int, default=40000,  help='limit the train set sentences to this many tokens')
 
 parser.add_argument('--valid_size',   type=int, default=None, help='size of valid dataset (tested on coco only)')
@@ -55,6 +56,9 @@ parser.add_argument('--max_train_data',      type=int, default=None,  help='limi
 parser.add_argument('--prefix', type=str, default='[time]',      help='prefix to denote the model, nothing or [time]')
 parser.add_argument('--fast',   dest='model', action='store_const', const=FastTransformer, default=Transformer)
 
+#multigpu settings
+parser.add_argument('--num_gpus', type=int, default=1, help='number of gpus to use')
+
 # model ablation settings
 parser.add_argument('--ffw_block',     type=str, default="residual", choices=['residual', 'highway', 'nonresidual'])
 parser.add_argument('--diag',   action='store_true', default=False, help='ignore diagonal attention when doing self-attention.')
@@ -67,7 +71,7 @@ parser.add_argument('--share_embed_enc_dec1',  action='store_true', default=Fals
 parser.add_argument('--positional', action='store_true', default=True, help='incorporate positional information in key/value')
 parser.add_argument('--enc_last', action='store_true', default=False, help='attend only to last encoder hidden states')
 
-parser.add_argument('--params', type=str, default='user', choices=['user', 'small', 'big'])
+parser.add_argument('--params', type=str, default='user', choices=['user', 'small', 'big', 'bigger', 'biggest'])
 parser.add_argument('--n_layers',  type=int, default=5,    help='number of layers')
 parser.add_argument('--n_heads',   type=int,   default=2, help='number of heads')
 parser.add_argument('--d_model',   type=int,   default=278, help='number of heads')
@@ -87,6 +91,7 @@ parser.add_argument('--bp',  type=float,   default=1.0, help='number of heads')
 parser.add_argument('--mode',    type=str, default='train',  choices=['train', 'test', 'distill']) # distill : take a trained AR model and decode a training set
 parser.add_argument('--gpu',     type=int, default=0,        help='GPU to use or -1 for CPU')
 parser.add_argument('--seed',    type=int, default=19920206, help='seed for randomness')
+parser.add_argument('--random_seed', action="store_true", default=False)
 parser.add_argument('--distill_which',    type=int, default=0 )
 parser.add_argument('--decode_which',    type=int, default=0 )
 parser.add_argument('--test_which',    type=str, default='test',  choices=['valid', 'test']) # distill : take a trained AR model and decode a training set
@@ -95,7 +100,9 @@ parser.add_argument('--test_which',    type=str, default='test',  choices=['vali
 parser.add_argument('--no_tqdm',       action="store_true", default=False)
 parser.add_argument('--eval_every',    type=int, default=100,    help='run dev every')
 parser.add_argument('--save_every',    type=int, default=-1,   help='5000')
+parser.add_argument('--save_last',    action="store_true", default=False,   help='save very last checkpoint')
 parser.add_argument('--batch_size',    type=int, default=2048,    help='# of tokens processed per batch')
+
 parser.add_argument('--optimizer',     type=str, default='Adam')
 parser.add_argument('--lr', type=float, default=3e-4)
 parser.add_argument('--lr_schedule', type=str, default='anneal', choices=['transformer', 'anneal', 'fixed'])
@@ -103,7 +110,7 @@ parser.add_argument('--warmup', type=int, default=16000, help='maximum steps to 
 parser.add_argument('--anneal_steps', type=int, default=250000, help='maximum steps to linearly anneal the learning rate')
 parser.add_argument('--maximum_steps', type=int, default=5000000, help='maximum steps you take to train a model')
 parser.add_argument('--drop_ratio', type=float, default=0.1, help='dropout ratio')
-parser.add_argument('--drop_len_pred', type=float, default=0.3, help='dropout ratio for length prediction module')
+parser.add_argument('--drop_len_pred', type=float, default=0.5, help='dropout ratio for length prediction module')
 parser.add_argument('--input_drop_ratio', type=float, default=0.1, help='dropout ratio only for inputs')
 parser.add_argument('--grad_clip', type=float, default=-1.0, help='gradient clipping')
 
@@ -112,7 +119,6 @@ parser.add_argument('--trg_len_option',     type=str, default="reference", choic
 #parser.add_argument('--trg_len_option_valid',     type=str, default="average", choices=['reference', "noisy_ref", 'average', 'fixed', 'predict'])
 parser.add_argument('--trg_len_ratio',  type=float,   default=2.0)
 parser.add_argument('--decoder_input_how', type=str, default='copy', choices=['copy', 'interpolate', 'pad', 'wrap'])
-parser.add_argument('--finetune_trg_len',  action='store_true', default=False, help="finetune one layer that predicts target len offset")
 parser.add_argument('--use_predicted_trg_len',  action='store_true', default=False, help="use predicted target len masks")
 parser.add_argument('--max_offset', type=int, default=20, help='max target len offset of the whole dataset')
 
@@ -141,7 +147,8 @@ parser.add_argument('--f_size',        type=int,   default=1, help='heap size fo
 parser.add_argument('--alpha',         type=float, default=1, help='length normalization weights')
 parser.add_argument('--temperature',   type=float, default=1, help='smoothing temperature for noisy decodig')
 parser.add_argument('--remove_repeats',       action='store_true', default=False, help='debug mode: no saving or tensorboard')
-parser.add_argument('--num_samples', type=int, default=2, help='number of samples to use when using non-argmax decoding')
+parser.add_argument('--num_train_samples', type=int, default=1, help='number of samples to use when using sampling for training')
+parser.add_argument('--num_valid_samples', type=int, default=1, help='number of samples to use when using sampling for validation (decoding)')
 parser.add_argument('--T', type=float, default=1, help='softmax temperature when decoding')
 
 #parser.add_argument('--jaccard_stop', action='store_true', default=False, help='use jaccard index to stop decoding')
@@ -158,6 +165,8 @@ parser.add_argument('--use_distillation', action='store_true', default=False,   
 
 # debugging
 parser.add_argument('--debug',       action='store_true', help='debug mode: no saving or tensorboard')
+parser.add_argument('--save_decs',       action='store_true', help='save decoding')
+
 parser.add_argument('--tensorboard', action='store_true', default=True, help='use TensorBoard')
 
 # save path
@@ -210,9 +219,21 @@ if args.params == 'small':
     args.__dict__.update(hparams)
 elif args.params == 'big':
     if args.dataset != "mscoco":
-        hparams = {'d_model': 512, 'd_hidden': 512, 'n_layers': 6, 'n_heads': 8, 'warmup': 16000}
+        hparams = {'d_model': 512, 'd_hidden': 512, 'n_layers': 6, 'n_heads': 8, 'warmup': args.warmup}
     else:
-        hparams = {'d_model': 512, 'd_hidden': 512, 'n_heads': 8, 'warmup': 16000}
+        hparams = {'d_model': 512, 'd_hidden': 512, 'n_heads': 8, 'warmup': args.warmup}
+    args.__dict__.update(hparams)
+elif args.params == 'bigger':
+    if args.dataset != "mscoco":
+        hparams = {'d_model': 512, 'd_hidden': 1024, 'n_layers': 6, 'n_heads': 8, 'warmup': args.warmup}
+    else:
+        hparams = {'d_model': 512, 'd_hidden': 1024, 'n_heads': 8, 'warmup': args.warmup}
+    args.__dict__.update(hparams)
+elif args.params == 'biggest':
+    if args.dataset != "mscoco":
+        hparams = {'d_model': 1024, 'd_hidden': 1024, 'n_layers': 6, 'n_heads': 16, 'warmup': args.warmup}
+    else:
+        hparams = {'d_model': 1024, 'd_hidden': 1024, 'n_heads': 8, 'warmup': args.warmup}
     args.__dict__.update(hparams)
 
 hp_str = "{}".format('' if args.model is FastTransformer else 'ar_') + \
@@ -228,10 +249,10 @@ hp_str = "{}".format('' if args.model is FastTransformer else 'ar_') + \
          "{}_{}_{}_{}_".format(args.n_layers, args.d_model, args.d_hidden, args.n_heads) + \
          "{}".format("enc_last_" if args.enc_last else "") + \
          "drop_{}_".format(args.drop_ratio) + \
-         "{}".format("drop_len_pred_{}_".format(args.drop_len_pred) if args.finetune_trg_len else "") + \
          "{}_".format(args.lr) + \
          "{}_".format("{}".format(args.lr_schedule[:4])) + \
          "{}".format("anneal_steps_{}_".format(args.anneal_steps) if args.lr_schedule == "anneal" else "") + \
+         "{}".format("warmup_steps_{}_".format(args.warmup) if args.lr_schedule == "transformer" else "") + \
          "{}_".format(args.ffw_block[:4]) + \
          "{}".format("clip_{}_".format(args.grad_clip) if args.grad_clip != -1.0 else "") + \
          "{}".format("diag_" if args.diag else "") + \
@@ -283,6 +304,9 @@ if not args.debug:
     logger.addHandler(fh)
 
 # setup random seeds
+if args.random_seed:
+    args.seed = random.randint(1, args.seed)
+logger.info("random seed is {}".format(args.seed))
 random.seed(args.seed)
 np.random.seed(args.seed)
 torch.manual_seed(args.seed)
@@ -296,15 +320,21 @@ if args.dataset != "mscoco":
     # NOTE : UNK, PAD, INIT, EOS
 
 # setup many datasets (need to manaually setup)
-data_prefix = Path(data_path(args.dataset))
+if args.data_path is None:
+    data_prefix = Path(data_path(args.dataset))
+else:
+    data_prefix = Path(args.data_path)
 args.data_prefix = data_prefix
 if args.dataset == "mscoco":
     data_prefix = str(data_prefix)
 
 train_dir = "train" if not args.use_distillation else "distill/" + args.dataset[-4:]
+#train_dir = "train" if not args.use_distillation else "distill/"
 if args.dataset == 'iwslt-ende' or args.dataset == 'iwslt-deen':
+    '''
     if args.resume:
         train_dir += "2"
+    '''
     logger.info("TRAINING CORPUS : " + str(data_prefix / train_dir / 'train.tags.en-de.bpe'))
     train_data = NormalTranslationDataset(path=str(data_prefix / train_dir / 'train.tags.en-de.bpe'),
     exts=('.{}'.format(args.src), '.{}'.format(args.trg)), fields=(SRC, TRG),
@@ -348,6 +378,34 @@ elif args.dataset == 'wmt15-ende' or args.dataset == 'wmt15-deen':
     test_data = NormalTranslationDataset(path=str(data_prefix / test_dir / test_file),
     exts=('.{}'.format(args.src), '.{}'.format(args.trg)), fields=(SRC, TRG),
     load_dataset=args.load_dataset, save_dataset=args.save_dataset, prefix='normal')
+
+elif args.dataset == 'wmt14-ende' or args.dataset == 'wmt14-deen':
+    train_file = 'all_en-de.bpe'
+    if args.mode == "distill" and args.distill_which > 0:
+        train_file += ".{}".format(args.distill_which)
+    train_data = NormalTranslationDataset(path=str(data_prefix / train_dir / train_file),
+    exts=('.{}'.format(args.src), '.{}'.format(args.trg)), fields=(SRC, TRG),
+    load_dataset=args.load_dataset, save_dataset=args.save_dataset, prefix='normal') \
+        if args.mode in ["train", "distill"] else None
+
+    dev_dir = "dev"
+    dev_file = "wmt13-en-de.bpe"
+    if args.mode == "test" and args.decode_which > 0:
+        dev_dir = "dev_split"
+        dev_file += ".{}".format(args.decode_which)
+    dev_data = NormalTranslationDataset(path=str(data_prefix / dev_dir / dev_file),
+    exts=('.{}'.format(args.src), '.{}'.format(args.trg)), fields=(SRC, TRG),
+    load_dataset=args.load_dataset, save_dataset=args.save_dataset, prefix='normal')
+
+    test_dir = "test"
+    test_file = "wmt14-en-de.bpe"
+    if args.mode == "test" and args.decode_which > 0:
+        test_dir = "test_split"
+        test_file += ".{}".format(args.decode_which)
+    test_data = NormalTranslationDataset(path=str(data_prefix / test_dir / test_file),
+    exts=('.{}'.format(args.src), '.{}'.format(args.trg)), fields=(SRC, TRG),
+    load_dataset=args.load_dataset, save_dataset=args.save_dataset, prefix='normal')
+
 
 elif args.dataset == 'wmt16-enro' or args.dataset == 'wmt16-roen':
     train_file = 'corpus.bpe'
@@ -426,6 +484,7 @@ else:
         print ('vocab building done')
     args.__dict__.update({'vocab': len(mscoco_dataset.vocab)})
 
+# new, count, sofar
 def dyn_batch_with_padding(new, i, sofar):
     prev_max_len = sofar / (i - 1) if i > 1 else 0
     return max(len(new.src), len(new.trg),  prev_max_len) * i
@@ -465,12 +524,22 @@ if args.dataset != "mscoco":
         train_flag = False
     else:
         train_flag = False
-    train_real = data.BucketIterator(train_data, args.batch_size, device=args.gpu, batch_size_fn=batch_size_fn,
-                                    train=train_flag, repeat=train_flag, shuffle=train_flag) if not train_data is None else None
-    dev_real = data.BucketIterator(dev_data, args.batch_size, device=args.gpu, batch_size_fn=batch_size_fn,
-                                    train=False, repeat=False, shuffle=False) if not dev_data is None else None
-    test_real = data.BucketIterator(test_data, args.batch_size, device=args.gpu, batch_size_fn=batch_size_fn,
-                                    train=False, repeat=False, shuffle=False) if not test_data is None else None
+
+    if args.num_gpus == 1:
+        train_real = data.BucketIterator(train_data, args.batch_size, device=args.gpu, batch_size_fn=batch_size_fn,
+                                        train=train_flag, repeat=train_flag, shuffle=train_flag) if not train_data is None else None
+        dev_real = data.BucketIterator(dev_data, args.batch_size, device=args.gpu, batch_size_fn=batch_size_fn,
+                                        train=False, repeat=False, shuffle=False) if not dev_data is None else None
+        test_real = data.BucketIterator(test_data, args.batch_size, device=args.gpu, batch_size_fn=batch_size_fn,
+                                        train=False, repeat=False, shuffle=False) if not test_data is None else None
+    else:
+        train_real = data.BucketIterator(train_data, args.batch_size*args.num_gpus, device=args.gpu, batch_size_fn=batch_size_fn,
+                                        train=train_flag, repeat=train_flag, shuffle=train_flag, num_gpus=args.num_gpus) if not train_data is None else None
+        dev_real = data.BucketIterator(dev_data, args.batch_size, device=args.gpu, batch_size_fn=batch_size_fn,
+                                        train=False, repeat=False, shuffle=False, num_gpus=1) if not dev_data is None else None
+        test_real = data.BucketIterator(test_data, args.batch_size, device=args.gpu, batch_size_fn=batch_size_fn,
+                                        train=False, repeat=False, shuffle=False, num_gpus=1) if not test_data is None else None
+
 else:
     train_real = torch.utils.data.DataLoader(
         train_data, batch_sampler=train_sampler, pin_memory=args.gpu>-1, num_workers=8)
@@ -505,6 +574,18 @@ if args.dataset != "mscoco":
 else:
     model = args.model(src=None, trg=mscoco_dataset, args=args)
 
+
+if args.num_gpus > 1:
+    logger.info("multi gpu")
+    if type(model) is Transformer:
+        model = MultiGPUTransformer(model)
+        model = torch.nn.DataParallel(model)
+    elif type(model) is FastTransformer:
+        model = MultiGPUFastTransformer(model, args)
+        model = torch.nn.DataParallel(model)
+    else:
+        sys.exit("not supported")
+
 if args.mode == "train":
     logger.info(str(model))
 
@@ -521,9 +602,12 @@ if args.load_encoder_from is not None:
 
 if args.load_from is not None:
     if args.gpu > -1:
-        with torch.cuda.device(args.gpu):
-            model.load_state_dict(torch.load(str(args.model_path / args.load_from) + '.pt',
-            map_location=lambda storage, loc: storage.cuda()), strict=False)  # load the pretrained models.
+        if args.num_gpus > 1:
+            model.module.model.load_state_dict(torch.load(str(args.model_path / args.load_from)\
+                + '.pt', map_location=lambda storage, loc: storage.cuda()), strict=False)
+        else:
+            model.load_state_dict(torch.load(str(args.model_path / args.load_from)\
+                + '.pt', map_location=lambda storage, loc: storage.cuda()), strict=False)
     else:
         model.load_state_dict(torch.load(str(args.model_path / args.load_from) + '.pt',
         map_location=lambda storage, loc: storage), strict=False)  # load the pretrained models.
@@ -548,11 +632,17 @@ args.__dict__.update({'hp_str': hp_str,  'logger': logger})
 # ----------------------------------------------------------------------------------------------------------------- #
 
 trg_len_dic = None
-if args.dataset != "mscoco" and (not "ro" in args.dataset or "predict" in args.trg_len_option or "average" in args.trg_len_option):
+
+# not mscoco and not ro and not lv and predict
+if args.dataset != "mscoco" and (not "ro" in args.dataset) and (not "lv" in args.dataset) and ("predict" in args.trg_len_option or "average" in args.trg_len_option):
 #if "predict" in args.trg_len_option or "average" in args.trg_len_option:
     #trg_len_dic = torch.load(os.path.join(data_path(args.dataset), "trg_len"))
-    trg_len_dic = torch.load( str(args.data_prefix / "trg_len_dic" / args.dataset[-4:]) )
-    trg_len_dic = organise_trg_len_dic(trg_len_dic)
+    trg_len_dic_path = Path(str(args.data_prefix / "trg_len_dic" / args.dataset[-4:]))
+    if args.trg_len_option == "average":
+        assert (trg_len_dic_path.exists())
+    if trg_len_dic_path.exists():
+        trg_len_dic = torch.load( str(args.data_prefix / "trg_len_dic" / args.dataset[-4:]) )
+        trg_len_dic = organise_trg_len_dic(trg_len_dic)
 
 if args.mode == 'train':
     logger.info('starting training')

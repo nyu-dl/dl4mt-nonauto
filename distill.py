@@ -1,5 +1,4 @@
 import copy
-import ipdb
 import math
 import os
 import torch
@@ -15,7 +14,6 @@ from data import NormalField, NormalTranslationDataset, TripleTranslationDataset
 from utils import Metrics, Best, computeBLEU, Batch, masked_sort, computeGroupBLEU, organise_trg_len_dic, make_decoder_masks, double_source_masks, remove_repeats, remove_repeats_tensor, print_bleu
 from time import gmtime, strftime
 import copy
-from multiset import Multiset
 import json
 
 tokenizer = lambda x: x.replace('@@ ', '').split()
@@ -76,14 +74,15 @@ def distill_model(args, model, dev, evaluate=True,
 
         batch_size, src_len, hsize = encoding[0].size()
 
-        # for now
-        if type(model) is Transformer:
-            all_decodings = []
-            decoding = model(encoding, source_masks, decoder_inputs, decoder_masks,
-                            beam=args.beam_size, alpha=args.alpha, \
-                             decoding=True, feedback=attentions)
-            all_decodings.append( decoding )
-            curr_iter = [0]
+        with torch.no_grad():
+            # for now
+            if type(model) is Transformer:
+                all_decodings = []
+                decoding = model(encoding, source_masks, decoder_inputs, decoder_masks,
+                                beam=args.beam_size, alpha=args.alpha, \
+                                 decoding=True, feedback=attentions)
+                all_decodings.append( decoding )
+                curr_iter = [0]
 
         used_t = time.time() - start_t
         curr_time += used_t

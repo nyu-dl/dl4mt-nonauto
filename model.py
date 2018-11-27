@@ -1,5 +1,4 @@
 import numpy as np
-import ipdb
 import torch
 import torchvision
 from torch import nn
@@ -225,6 +224,9 @@ class Attention(nn.Module):
             # dot_products.data.sub_(eye.unsqueeze(0))
 
         if mask is not None:
+            if type(mask) is Variable:
+                mask = mask.data
+
             if dot_products.dim() == 2:
                 dot_products.data -= ((1 - mask) * INF)
             else:
@@ -350,6 +352,7 @@ class DecoderLayer(nn.Module):
     def __init__(self, args, causal=True, diag=False,
                 positional=False):
         super().__init__()
+
         self.positional = positional
         self.selfattn = ResidualBlock(
             MultiHead2(args.d_model, args.d_model, args.n_heads,
@@ -514,6 +517,7 @@ class Decoder(nn.Module):
             T = self.length_dec
         else:
             T *= self.length_ratio
+        T = int(T)
 
         outs = Variable(encoding[0].data.new(B, T + 1).long().fill_(
                     self.field.vocab.stoi['<init>']))
@@ -617,6 +621,93 @@ class Decoder(nn.Module):
             if eos_yet.all():
                 return outs[:, 0, 1:]
         return outs[:, 0, 1:]
+
+class MultiGPUTransformer(nn.Module):
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+
+    def forward(self, sources, source_masks, decoder_inputs, decoder_masks, targets, target_masks):
+        # get encoding first
+        encoding = self.model.encoding(sources, source_masks)
+        # rest
+        out = self.model(encoding, source_masks, decoder_inputs, decoder_masks)
+        loss = self.model.cost(targets, target_masks, out=out)
+        loss = loss.view(-1)
+        return loss
+
+class MultiGPUFastTransformer(nn.Module):
+    def __init__(self, model, args):
+        super().__init__()
+        self.model = model
+        self.args = args
+
+    def forward(self, sources, source_masks, attention, decoder_masks, targets, target_masks, denoise, denoise_cor, trg_len_option="reference"):
+        # get encoding first
+        encoding = self.model.encoding(sources, source_masks)
+
+        # if trg_len_option is predict then given encoding predict target len offset
+        if trg_len_option == "predict":
+            target_offset = (target_masks.sum(-1) - source_masks.sum(-1)).clamp(min=-self.args.max_offset, max=self.args.max_offset)
+            source_len = source_masks.sum(-1)
+
+            pred_target_len_inputs_ = 0
+            for i_layer_ in range(self.args.n_layers):
+                pred_target_len_inputs_ += encoding[i_layer_]
+            pred_target_len_inputs_ = pred_target_len_inputs_.detach()
+
+            pred_target_offset_logits = self.model.pred_len(pred_target_len_inputs_.mean(1))
+            pred_target_offset_logits = self.model.pred_len_drop( pred_target_offset_logits )
+            # make sure that min targets is 0
+            pred_target_len_loss = F.cross_entropy(pred_target_offset_logits, (target_offset + self.args.max_offset).long(), reduce=False)
+            # calculate pred target len
+            pred_target_offset = pred_target_offset_logits.max(-1)[1] - self.args.max_offset
+            pred_target_len = source_len.long() + pred_target_offset
+
+        batch_size = encoding[0].size(0)
+        d_model = encoding[0].size(2)
+
+        # given decoder_masks and encoding[0] (embedding) gather correct input
+        decoder_inputs = torch.gather(encoding[0], dim=1, index=attention)
+
+        # now do decoder forward pass
+        losses = []
+        for iter_ in range(self.args.train_repeat_dec):
+            curr_iter = min(iter_, self.args.num_decs-1)
+            next_iter = min(curr_iter + 1, self.args.num_decs-1)
+
+            out = self.model(encoding, source_masks, decoder_inputs, decoder_masks, iter_=curr_iter, return_probs=False)
+
+            loss = self.model.cost2(targets, target_masks, out=out, iter_=curr_iter)
+
+            if not denoise[iter_]:
+                logits = self.model.decoder[curr_iter].out(out)
+                if self.args.use_argmax:
+                    _, argmax = torch.max(logits, dim=-1)
+                else:
+                    probs = softmax(logits)
+                    probs_sz = probs.size()
+                    argmax = torch.multinomial(probs.detach().contiguous().view(-1, probs_sz[-1]), 1).view(*probs_sz[:-1])
+
+            losses.append(loss)
+
+            # set inputs for decoder at the next iteration
+            decoder_inputs_ = 0
+            denoising_mask = 1
+            if self.args.next_dec_input in ["both", "emb"]:
+                if denoise[iter_]:
+                    decoder_inputs_ += F.embedding(denoise_cor[iter_], self.model.decoder[next_iter].out.weight * math.sqrt(self.args.d_model))
+                else:
+                    decoder_inputs_ += F.embedding(argmax, self.model.decoder[next_iter].out.weight * math.sqrt(self.args.d_model))
+            if self.args.next_dec_input in ["both", "out"]:
+                decoder_inputs_ += out
+            decoder_inputs = decoder_inputs_
+
+        if trg_len_option == "predict":
+            return losses, pred_target_len_loss, pred_target_len
+        else:
+            return losses
+
 
 class Transformer(nn.Module):
 
@@ -854,17 +945,21 @@ class Transformer(nn.Module):
         captions = torch.from_numpy(captions).long()
         return Variable(captions, requires_grad=False)
 
-    def quick_prepare(self, batch, fast=True, trg_len_option=None, trg_len_ratio=2.0, trg_len_dic=None, decoder_inputs=None, targets=None, decoder_masks=None, target_masks=None, source_masks=None, bp=1.00):
+    def quick_prepare_window(self, batch, fast=True, trg_len_option=None, trg_len_ratio=2.0, trg_len_dic=None, decoder_inputs=None, targets=None, decoder_masks=None, target_masks=None, source_masks=None, bp=1.00, window=5):
         sources,        source_masks    = self.prepare_sources(batch, source_masks)
         encoding                        = self.encoding(sources, source_masks)
         targets,        target_masks    = self.prepare_targets(batch, targets, decoder_masks)  # prepare decoder-targets
 
-        # predicted decoder masks
         if trg_len_option == "predict":
             target_offset = Variable((target_masks.sum(-1) - source_masks.sum(-1)).clamp_(-self.max_offset, self.max_offset), requires_grad=False) # batch_size tensor
             source_len = Variable(source_masks.sum(-1), requires_grad=False)
 
-            pred_target_offset_logits = self.pred_len((encoding[0]+encoding[1]+encoding[2]+encoding[3]+encoding[4]+encoding[5]).mean(1))
+            pred_target_len_inputs_ = 0
+            for i_layer_ in range(self.n_layers):
+                pred_target_len_inputs_ += encoding[i_layer_]
+            pred_target_len_inputs_ = pred_target_len_inputs_.detach()
+
+            pred_target_offset_logits = self.pred_len(pred_target_len_inputs_.mean(1))
             pred_target_offset_logits = self.pred_len_drop( pred_target_offset_logits )
             pred_target_len_loss = F.cross_entropy(pred_target_offset_logits, (target_offset + self.max_offset).long())
             pred_target_offset = pred_target_offset_logits.max(-1)[1] - self.max_offset
@@ -875,67 +970,120 @@ class Transformer(nn.Module):
         rest = []
 
         if fast:
-            # compute decoder_masks
-            if trg_len_option == "reference":
-                _, decoder_masks   = self.prepare_decoder_inputs(batch.trg, decoder_inputs, decoder_masks, bp=bp)
-
-            elif trg_len_option == "noisy_ref":
-                bp = np.random.uniform(bp, 1.0)
-                _, decoder_masks   = self.prepare_decoder_inputs(batch.trg, decoder_inputs, decoder_masks, bp=bp)
-
-            elif trg_len_option == "average":
-                decoder_masks = make_decoder_masks(source_masks, trg_len_dic)
-                #  we use the average target lengths
-
-            elif trg_len_option == "predict":
+            if trg_len_option == "predict":
                 # convert to numpy arrays first
                 source_len = source_masks.sum(-1).cpu().numpy()
                 target_len = target_masks.sum(-1).cpu().numpy()
                 pred_target_len = pred_target_len.data.cpu().numpy()
+                # make sure pred_target_len has no negative numbers
+                pred_target_len[pred_target_len<=2] = 2
 
-                if not self.use_predicted_trg_len:
-                    _, decoder_masks   = self.prepare_decoder_inputs(batch.trg, decoder_inputs, decoder_masks, bp=bp)
-                else:
-                    decoder_max_len = max(pred_target_len)
-                    decoder_masks = np.zeros((batch_size, decoder_max_len))
-                    for idx in range(pred_target_len.shape[0]):
-                        decoder_masks[idx][:pred_target_len[idx]] = 1
-                    decoder_masks = torch.from_numpy(decoder_masks).float()
-                    if source_masks.is_cuda:
-                        decoder_masks = decoder_masks.cuda()
-                    if bp < 1.0:
-                        decoder_masks = self.change_bp_masks(decoder_masks, bp)
+                # repeat pred_target_len window amount of times
+                pred_target_len_corr = np.zeros((batch_size * window))
+                for w in range(window):
+                    pred_target_len_corr[w*batch_size:(w+1)*batch_size] = pred_target_len + (w - window//2)
+
+                pred_target_len = np.int32(pred_target_len_corr[:])
+                # make sure pred_target_len has no negative numbers
+                pred_target_len[pred_target_len<=2] = 2
+
+                # create decoder masks based on predicted len
+                pred_decoder_max_len = max(pred_target_len)
+                pred_decoder_masks = np.zeros((pred_target_len.shape[0], pred_decoder_max_len))
+                for idx in range(pred_target_len.shape[0]):
+                    pred_decoder_masks[idx][:pred_target_len[idx]] = 1
+                pred_decoder_masks = torch.from_numpy(pred_decoder_masks).float()
+                if source_masks.is_cuda:
+                    pred_decoder_masks = pred_decoder_masks.cuda()
+                if bp < 1.0:
+                    pred_decoder_masks = self.change_bp_masks(pred_decoder_masks, bp)
+
+            encoding = [enc.repeat(window, 1, 1) for enc in encoding]
+            sources = sources.repeat(window, 1)
+            source_masks = source_masks.repeat(window, 1)
+
+            if trg_len_option == "predict":
+                pred_decoder_inputs, pred_decoder_masks   = self.prepare_initial(encoding, sources, source_masks, pred_decoder_masks)
+
+        rest = []
+        if trg_len_option == "predict":
+            return pred_decoder_inputs, pred_decoder_masks, targets, target_masks, sources, source_masks, encoding, batch_size, rest
+
+
+    def quick_prepare(self, batch, fast=True, trg_len_option=None, trg_len_ratio=2.0, trg_len_dic=None, decoder_inputs=None, targets=None, decoder_masks=None, target_masks=None, source_masks=None, bp=1.00):
+        sources,        source_masks    = self.prepare_sources(batch, source_masks)
+        encoding                        = self.encoding(sources, source_masks)
+        targets,        target_masks    = self.prepare_targets(batch, targets, decoder_masks)  # prepare decoder-targets
+
+        if trg_len_option == "predict":
+            target_offset = Variable((target_masks.sum(-1) - source_masks.sum(-1)).clamp_(-self.max_offset, self.max_offset), requires_grad=False) # batch_size tensor
+            source_len = Variable(source_masks.sum(-1), requires_grad=False)
+
+            pred_target_len_inputs_ = 0
+            for i_layer_ in range(self.n_layers):
+                pred_target_len_inputs_ += encoding[i_layer_]
+            pred_target_len_inputs_ = pred_target_len_inputs_.detach()
+
+            pred_target_offset_logits = self.pred_len(pred_target_len_inputs_.mean(1))
+            pred_target_offset_logits = self.pred_len_drop( pred_target_offset_logits )
+            pred_target_len_loss = F.cross_entropy(pred_target_offset_logits, (target_offset + self.max_offset).long())
+            pred_target_offset = pred_target_offset_logits.max(-1)[1] - self.max_offset
+            pred_target_len = source_len.long() + pred_target_offset
+
+        d_model = encoding[0].size(-1)
+        batch_size, src_max_len = source_masks.size()
+        rest = []
+
+        if fast:
+            # compute decoder_masks (for reference case)
+            _, decoder_masks   = self.prepare_decoder_inputs(batch.trg, decoder_inputs, decoder_masks, bp=bp)
+
+            if trg_len_option == "predict":
+                # convert to numpy arrays first
+                source_len = source_masks.sum(-1).cpu().numpy()
+                target_len = target_masks.sum(-1).cpu().numpy()
+                pred_target_len = pred_target_len.data.cpu().numpy()
+                # make sure pred_target_len has no negative numbers
+                pred_target_len[pred_target_len<=2] = 2
+
+                # create decoder masks based on predicted len
+                pred_decoder_max_len = max(pred_target_len)
+                pred_decoder_masks = np.zeros((batch_size, pred_decoder_max_len))
+                for idx in range(pred_target_len.shape[0]):
+                    pred_decoder_masks[idx][:pred_target_len[idx]] = 1
+                pred_decoder_masks = torch.from_numpy(pred_decoder_masks).float()
+                if source_masks.is_cuda:
+                    pred_decoder_masks = pred_decoder_masks.cuda()
+                if bp < 1.0:
+                    pred_decoder_masks = self.change_bp_masks(pred_decoder_masks, bp)
 
                 # check the results of predicting target length
                 pred_target_len_correct = np.sum(pred_target_len == target_len)*100/batch_size
                 pred_target_len_approx = np.sum(np.abs(pred_target_len - target_len) < 5)*100/batch_size
 
-                # results with average len
-                average_target_len = [query_trg_len_dic(trg_len_dic, source) for source in source_len]
-                average_target_len = np.array(average_target_len)
-                average_target_len_correct = np.sum(average_target_len == target_len)*100/batch_size
-                average_target_len_approx = np.sum(np.abs(average_target_len - target_len) < 5)*100/batch_size
+                if trg_len_dic != None:
+                    # results with average len
+                    average_target_len = [query_trg_len_dic(trg_len_dic, source) for source in source_len]
+                    average_target_len = np.array(average_target_len)
+                    average_target_len_correct = np.sum(average_target_len == target_len)*100/batch_size
+                    average_target_len_approx = np.sum(np.abs(average_target_len - target_len) < 5)*100/batch_size
+                else:
+                    average_target_len_correct = 0.0
+                    average_target_len_approx = 0.0
 
                 rest = [pred_target_len_loss, pred_target_len_correct, pred_target_len_approx, average_target_len_correct, average_target_len_approx]
 
-            elif "fixed" in trg_len_option:
-                trg_len = (batch.trg != 1).sum(-1).int().data.cpu().numpy().tolist()
-
-                source_lens = source_masks.sum(-1).cpu().numpy()
-                decoder_masks = torch.zeros(batch_size, int(round(trg_len_ratio * src_max_len)))
-                dec_len = int(round(trg_len_ratio * src_max_len))
-
-                for bi in range(batch_size):
-                    ss = source_lens[bi]
-                    decoder_masks[bi,:int(round(trg_len_ratio*ss))] = 1
-
-                if encoding[0].is_cuda:
-                    decoder_masks = decoder_masks.cuda(encoding[0].get_device())
             decoder_inputs, decoder_masks   = self.prepare_initial(encoding, sources, source_masks, decoder_masks)
+            if trg_len_option == "predict":
+                pred_decoder_inputs, pred_decoder_masks   = self.prepare_initial(encoding, sources, source_masks, pred_decoder_masks)
+
         else:
             decoder_inputs, decoder_masks   = self.prepare_decoder_inputs(batch.trg, decoder_inputs, decoder_masks)     # prepare decoder-inputs
 
-        return decoder_inputs, decoder_masks, targets, target_masks, sources, source_masks, encoding, decoder_inputs.size(0), rest
+        if trg_len_option == "predict":
+            return decoder_inputs, decoder_masks, pred_decoder_inputs, pred_decoder_masks, targets, target_masks, sources, source_masks, encoding, decoder_inputs.size(0), rest
+        else:
+            return decoder_inputs, decoder_masks, targets, target_masks, sources, source_masks, encoding, decoder_inputs.size(0), rest
 
     def forward(self, encoding, source_masks, decoder_inputs, decoder_masks,
                 decoding=False, beam=1, alpha=0.6, return_probs=False, positions=None, feedback=None):
@@ -1065,8 +1213,8 @@ class FastTransformer(Transformer):
         if not return_probs:
             return output
         else:
-            return output, out, logits # NOTE don't do softmax for validation
-            #return output, out, softmax(logits, T=T)
+            #return output, out, logits # NOTE don't do softmax for validation
+            return output, out, softmax(logits, T=T)
 
     def cost(self, targets, target_mask, out=None, iter_=0, return_logits=False):
         # get loss in a sequence-format to save computational time.
@@ -1076,6 +1224,22 @@ class FastTransformer(Transformer):
         if return_logits:
             return loss, logits
         return loss
+
+    # cost2 is just a different implementation of cost
+    def cost2(self, targets, target_mask, out=None, iter_=0, return_logits=False):
+        # prepare targets
+        targets_sz = targets.size()
+        targets = targets.view(targets_sz[0]*targets_sz[1])
+        # prepare logits
+        logits = self.decoder[iter_].out(out)
+        logits_sz = logits.size()
+        logits = logits.view(logits_sz[0]*logits_sz[1], logits_sz[2])
+        loss = F.cross_entropy(logits, targets, ignore_index=1, reduce=False)
+        loss = loss.view(targets_sz)
+        if return_logits:
+            return loss, logits
+        return loss
+
 
 def mask(targets, out, input_mask=None, return_mask=False):
     if input_mask is None:

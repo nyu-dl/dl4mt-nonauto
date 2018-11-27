@@ -1,5 +1,4 @@
 import copy
-import ipdb
 import math
 import os
 import torch
@@ -16,7 +15,10 @@ from utils import Metrics, Best, computeBLEU, computeBLEUMSCOCO, Batch, masked_s
         double_source_masks, remove_repeats, remove_repeats_tensor, print_bleu, oracle_converged, equality_converged, jaccard_converged
 from time import gmtime, strftime
 import copy
-from multiset import Multiset
+try:
+    from multiset import Multiset
+except:
+    pass
 
 tokenizer = lambda x: x.replace('@@ ', '').split()
 
@@ -150,7 +152,7 @@ def decode_model(args, model, dev, evaluate=True, trg_len_dic=None,
         progressbar = tqdm(total=200, desc='start decoding')
 
     model.eval()
-    if not args.debug:
+    if args.save_decs:
         decoding_path.mkdir(parents=True, exist_ok=True)
         handles = [(decoding_path / name ).open('w') for name in names]
 
@@ -174,10 +176,17 @@ def decode_model(args, model, dev, evaluate=True, trg_len_dic=None,
         start_t = time.time()
 
         if args.dataset != "mscoco":
-            decoder_inputs, decoder_masks,\
-            targets, target_masks,\
-            sources, source_masks,\
-            encoding, batch_size, rest = model.quick_prepare(dev_batch, fast=(type(model) is FastTransformer), trg_len_option=args.trg_len_option, trg_len_ratio=args.trg_len_ratio, trg_len_dic=trg_len_dic, bp=args.bp)
+            if args.trg_len_option == "predict":
+                _, _, decoder_inputs, decoder_masks,\
+                targets, target_masks,\
+                sources, source_masks,\
+                encoding, batch_size, rest = model.quick_prepare(dev_batch, fast=(type(model) is FastTransformer), trg_len_option=args.trg_len_option, trg_len_ratio=args.trg_len_ratio, trg_len_dic=trg_len_dic, bp=args.bp)
+            else:
+                decoder_inputs, decoder_masks,\
+                targets, target_masks,\
+                sources, source_masks,\
+                encoding, batch_size, rest = model.quick_prepare(dev_batch, fast=(type(model) is FastTransformer), trg_len_option=args.trg_len_option, trg_len_ratio=args.trg_len_ratio, trg_len_dic=trg_len_dic, bp=args.bp)
+
         else:
             # only use first caption for calculating log likelihood
             all_captions = dev_batch[1]
@@ -192,32 +201,33 @@ def decode_model(args, model, dev, evaluate=True, trg_len_dic=None,
 
         batch_size, src_len, hsize = encoding[0].size()
 
-        # for now
-        if type(model) is Transformer:
-            all_decodings = []
-            decoding = model(encoding, source_masks, decoder_inputs, decoder_masks,
-                            beam=args.beam_size, alpha=args.alpha, \
-                             decoding=True, feedback=attentions)
-            all_decodings.append( decoding )
-            num_iters = [0]
-
-        elif type(model) is FastTransformer:
-            decoding, all_decodings, num_iters, argmax_all_probs = run_fast_transformer(decoder_inputs, decoder_masks, \
-                                        sources, source_masks, targets, encoding, model, args, use_argmax=True)
-            num_iters_total.extend( num_iters )
-
-            if not args.use_argmax:
-                for _ in range(args.num_samples):
-                    _, _, _, sampled_all_probs = run_fast_transformer(decoder_inputs, decoder_masks, \
-                                                sources, source_masks, encoding, model, args, use_argmax=False)
-                    for iter_ in range(args.valid_repeat_dec):
-                        argmax_all_probs[iter_] = argmax_all_probs[iter_] + sampled_all_probs[iter_]
-
+        with torch.no_grad():
+            # for now
+            if type(model) is Transformer:
                 all_decodings = []
-                for iter_ in range(args.valid_repeat_dec):
-                    argmax_all_probs[iter_] = argmax_all_probs[iter_] / args.num_samples
-                    all_decodings.append(torch.max(argmax_all_probs[iter_], dim=-1)[-1])
-                decoding = all_decodings[-1]
+                decoding = model(encoding, source_masks, decoder_inputs, decoder_masks,
+                                beam=args.beam_size, alpha=args.alpha, \
+                                 decoding=True, feedback=attentions)
+                all_decodings.append( decoding )
+                num_iters = [0]
+
+            elif type(model) is FastTransformer:
+                decoding, all_decodings, num_iters, argmax_all_probs = run_fast_transformer(decoder_inputs.clone(), decoder_masks.clone(), \
+                                            sources.clone(), source_masks.clone(), targets.clone(), [enc.clone() for enc in encoding], model, args, use_argmax=True)
+                num_iters_total.extend( num_iters )
+
+                if not args.use_argmax:
+                    for _ in range(args.num_valid_samples):
+                        _, _, _, sampled_all_probs = run_fast_transformer(decoder_inputs.clone(), decoder_masks.clone(), \
+                                                    sources.clone(), source_masks.clone(), targets.clone(), [enc.clone() for enc in encoding], model, args, use_argmax=False)
+                        for iter_ in range(args.valid_repeat_dec):
+                            argmax_all_probs[iter_] = argmax_all_probs[iter_] + sampled_all_probs[iter_]
+
+                    all_decodings = []
+                    for iter_ in range(args.valid_repeat_dec):
+                        argmax_all_probs[iter_] = argmax_all_probs[iter_] / (args.num_valid_samples + 1)
+                        all_decodings.append(torch.max(argmax_all_probs[iter_], dim=-1)[-1])
+                    decoding = all_decodings[-1]
 
         used_t = time.time() - start_t
         curr_time += used_t
@@ -292,7 +302,7 @@ def decode_model(args, model, dev, evaluate=True, trg_len_dic=None,
 
         timings += [used_t]
 
-        if not args.debug:
+        if args.save_decs:
             for s, t, d in zip(outputs_unidx[0], outputs_unidx[1], outputs_unidx[2]):
                 s, t, d = s.replace('@@ ', ''), t.replace('@@ ', ''), d.replace('@@ ', '')
                 print(s, file=handles[0], flush=True)

@@ -1,5 +1,4 @@
 import math
-import ipdb
 import torch
 import random
 import numpy as np
@@ -95,6 +94,31 @@ def corpus_bleu(list_of_references, hypotheses, weights=(0.25, 0.25, 0.25, 0.25)
     s =  bp * math.exp(math.fsum(s)) * 100
     final_bleu = round(s, 4) if emulate_multibleu else s
     return (final_bleu, p_n_, bp, ref_lengths, hyp_lengths)
+
+def evaluate_pred_target_len(source_masks, target_masks, pred_target_len, trg_len_dic):
+    # evaluate target length prediction (in numpy)
+    batch_size = source_masks.size(0)
+    source_len = source_masks.sum(-1).data.cpu().numpy()
+    target_len = target_masks.sum(-1).data.cpu().numpy()
+    pred_target_len = pred_target_len.data.cpu().numpy()
+
+    results = []
+    # check the results of predicting target length
+    pred_target_len_correct = np.sum(pred_target_len == target_len)*100/batch_size
+    pred_target_len_approx = np.sum(np.abs(pred_target_len - target_len) < 5)*100/batch_size
+    results.append(pred_target_len_correct)
+    results.append(pred_target_len_approx)
+
+    # results with average len
+    if trg_len_dic is not None:
+        average_target_len = [query_trg_len_dic(trg_len_dic, source) for source in source_len]
+        average_target_len = np.array(average_target_len)
+        average_target_len_correct = np.sum(average_target_len == target_len)*100/batch_size
+        average_target_len_approx = np.sum(np.abs(average_target_len - target_len) < 5)*100/batch_size
+        results.append(average_target_len_correct)
+        results.append(average_target_len_approx)
+
+    return results
 
 INF = 1e10
 TINY = 1e-9
@@ -285,13 +309,14 @@ class Metrics:
         self.metrics.update({metric: 0 for metric in self.metrics})
 
 class Best:
-    def __init__(self, cmp_fn, *metrics, model=None, opt=None, path='', gpu=0, which=[0]):
+    def __init__(self, cmp_fn, *metrics, model=None, opt=None, path='', gpu=0, num_gpus=1, which=[0]):
         self.cmp_fn = cmp_fn
         self.model = model
         self.opt = opt
         self.path = path + '.pt'
         self.metrics = OrderedDict((metric, None) for metric in metrics)
         self.gpu = gpu
+        self.num_gpus = num_gpus
         self.which = which
         self.best_cmp_value = None
 
@@ -307,7 +332,11 @@ class Best:
 
                 #open(self.path + '.temp', 'w')
                 if self.model is not None:
-                    torch.save(self.model.state_dict(), self.path)
+                    #torch.save(self.model.module.model.state_dict(), self.path)
+                    if self.num_gpus > 1:
+                        torch.save(self.model.module.model.state_dict(), self.path)
+                    else:
+                        torch.save(self.model.state_dict(), self.path)
 
                 if self.opt is not None:
                     torch.save([self.i, self.opt.state_dict()], self.path + '.states')
@@ -430,7 +459,8 @@ def corrupt_target_fix(trg, decoder_masks, vocab_size, weight=0.1, cor_p=[0.1, 0
 def corrupt_target(trg, decoder_masks, vocab_size, weight=0.1, cor_p=[0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1]):
     batch_size, max_trg_len = trg.size()
     max_dec_len = decoder_masks.size(1)
-    dec_lens = (decoder_masks == 1).sum(-1).cpu().numpy()
+    #dec_lens = (decoder_masks == 1).sum(-1).cpu().numpy()
+    dec_lens = (decoder_masks.data == 1).sum(-1).cpu().numpy()
 
     num_corrupts = np.array( [ np.random.choice(dec_lens[bidx]-1,
                                                min( max( math.floor(weight * dec_lens[bidx]), 1 ), dec_lens[bidx]-1 ),
@@ -505,6 +535,18 @@ def remove_repeats(lst_of_sentences):
     for sentence in lst_of_sentences:
         lst.append( " ".join([x[0] for x in groupby(sentence.split())]) )
     return lst
+
+def remove_repeats_tensor2(tensor):
+    tensor = tensor.data.cpu().numpy()
+    max_size = tensor.shape[1]
+    newtensor = []
+    for x in tensor:
+        remove_repeats_x = [x[0] for x in groupby(x)]
+        remove_repeats_x = remove_repeats_x + [1 for _ in range(max_size - len(remove_repeats_x))]
+        newtensor.append(remove_repeats_x)
+    newtensor = np.array(newtensor)
+    assert (tensor.shape == newtensor.shape)
+    return Variable(torch.from_numpy(newtensor))
 
 def remove_repeats_tensor(tensor):
     tensor = tensor.data.cpu()

@@ -1,5 +1,4 @@
 import math
-import ipdb
 import torch
 import random
 import numpy as np
@@ -34,6 +33,8 @@ def data_path(dataset):
         path="IWSLT/en-de/"
     elif dataset == "wmt15-ende" or dataset == "wmt15-deen":
         path="wmt15/deen_new/"
+    elif dataset == "wmt14-ende" or dataset == "wmt14-deen":
+        path="wmt14/en-de/"
     elif dataset == "wmt16-enro" or dataset == "wmt16-roen":
         path="wmt16/en-ro/"
     elif dataset == "wmt17-enlv" or dataset == "wmt17-lven":
@@ -46,7 +47,10 @@ def data_path(dataset):
        or "dgx" in os.uname()[1] \
        or "lion" in os.uname()[1]:
         if dataset != "mscoco":
-            return "/misc/kcgscratch1/ChoGroup/jason/{}".format(path)
+            if dataset == "iwslt-ende" or dataset == "iwslt-deen":
+                return "/misc/kcgscratch1/ChoGroup/jason/{}".format(path)
+            else:
+                return "/misc/kcgscratch1/ChoGroup/jason/corpora/{}".format(path)
         else:
             return "/misc/kcgscratch1/ChoGroup/mansimov/{}".format(path)
     else:
