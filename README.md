@@ -1,3 +1,13 @@
+## This is the latest version of the code that was used for our EMNLP 2018 paper
+
+## This version includes
+* PyTorch 0.4
+* MultiGPU training of model
+* Joint training of both non-autoregressive model and length prediction module at the same time
+* WMT'14 datasets and pretrained non-autoregressive models
+
+==================================
+
 Deterministic Non-Autoregressive Neural Sequence Modeling by Iterative Refinement
 ==================================
 PyTorch implementation of the models described in the paper [Deterministic Non-Autoregressive Neural Sequence Modeling by Iterative Refinement](https://arxiv.org/abs/1802.06901 "Deterministic Non-Autoregressive Neural Sequence Modeling by Iterative Refinement").
@@ -30,15 +40,16 @@ The original translation corpora can be downloaded from ([IWLST'16 En-De](https:
 | IWSLT'16 En-De     | [Data](https://drive.google.com/file/d/1m7dZqEXHWPYcre6xxsFwFLrb9CRCZGmn/view?usp=sharing) | [Models](https://drive.google.com/open?id=1N8tfU5ttnov2jWk3-PHVMJClQA0pKXoN) |
 | WMT'16 En-Ro       | [Data](https://drive.google.com/file/d/1YrAwCEuktG-iDVxtEW-FE72uFTLc5QMl/view?usp=sharing) | [Models](https://drive.google.com/open?id=1qHSkrmTgj5c4U54zJZomdXQ_YUbhhfVi) |
 | WMT'15 En-De       | [Data](https://drive.google.com/file/d/1Q5-54S34HgC36IxJEZLwduKKW_EXZHWb/view?usp=sharing) | [Models](https://drive.google.com/open?id=1TJobn-RNxMDNLBqgglAmhA5vV1kpCebf) |
+| WMT'14 En-De (**new**)      | [Data](https://drive.google.com/file/d/1t7w0dmURRkXIbmzzlIUhrffw8eYctsIT/view?usp=sharing) | [Models](https://drive.google.com/file/d/1Wmzm5V_jxffT3yfZ7xVt7WX17ldNzpUW/view?usp=sharing) |
 | MS COCO            | [Data](https://drive.google.com/open?id=10RJbEb71CQZzaPtvS__KS50Fi5SrHHTN) | [Models](https://drive.google.com/open?id=1hqT9Hf8nGlWP9pqyAg4KRDR1QfDCvW4z) |
 
 Before you run the code
 ------------------
-Set correct path to data in `data_path()` function located in [`data.py`](https://github.com/jasonleeinf/non-auto-decoding/blob/96f7765399133c79ad4d23768dd530ee3eb07990/data.py#L44): 
+Set correct path to data in `data_path()` function located in [`data.py`](https://github.com/jasonleeinf/non-auto-decoding/blob/96f7765399133c79ad4d23768dd530ee3eb07990/data.py#L44):
 
 Loading & Decoding from Pre-trained Models
 ------------------
-1. For `vocab_size`, use `60000` for WMT'15 En-De, `40000` for the other translation datasets and `10000` for MS COCO.
+1. For `vocab_size`, use `60000` for WMT'14 En-De, `60000` for WMT'15 En-De, `40000` for the other translation datasets and `10000` for MS COCO.
 2. For `params`, use `big` for WMT'15 En-De and `small` for the other translation datasets.
 
 #### Autoregressive
