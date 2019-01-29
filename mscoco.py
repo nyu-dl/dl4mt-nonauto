@@ -9,7 +9,6 @@ import numpy as np
 import time
 import random
 from collections import OrderedDict
-import ipdb
 
 def process_json(dataPath, annFile, max_len=None, size=None):
     annPath = os.path.join(dataPath, annFile)
