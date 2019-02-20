@@ -18,10 +18,10 @@ Dependencies
 ------------------
 ### Python
 * Python 3.6
-* PyTorch 0.3
+* PyTorch 0.4
 * Numpy
 * NLTK
-* torchtext
+* torchtext ( you need to install my modified multigpu version https://github.com/mansimov/pytorch_text_multigpu )
 * torchvision
 
 ### GPU
